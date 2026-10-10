@@ -19,7 +19,7 @@ class Qwen3AlignerLoader:
     def INPUT_TYPES(cls):
         return {"required": {
             "qwen3aligner_name": (folder_paths.get_filename_list("qwen3asr"), {
-                "tooltip": "Single-file Qwen3-ForcedAligner checkpoint (see convert_qwen3aligner_checkpoint.py)."}),
+                "tooltip": "Single-file Qwen3-ForcedAligner checkpoint (see Model Links in README)."}),
         }}
 
     RETURN_TYPES = ("QWEN3ALIGNER",)
@@ -38,8 +38,8 @@ class Qwen3AlignerLoader:
                 or "score.weight" not in sd):
             raise RuntimeError(
                 "ERROR: not a single-file Qwen3-ForcedAligner checkpoint. "
-                "Merge the model folder first: "
-                "python convert_qwen3aligner_checkpoint.py <model_folder> <out.safetensors>"
+                "Download a pre-converted one: "
+                "https://huggingface.co/Aero-Ex/ComfyUI-Qwen3ASR"
             )
 
         config = json.loads(metadata["qwen3aligner.config"])

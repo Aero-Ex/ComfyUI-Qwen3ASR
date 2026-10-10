@@ -21,7 +21,7 @@ class Qwen3ASRLoader:
     def INPUT_TYPES(cls):
         return {"required": {
             "qwen3asr_name": (folder_paths.get_filename_list("qwen3asr"), {
-                "tooltip": "Single-file Qwen3-ASR checkpoint (see convert_qwen3asr_checkpoint.py)."}),
+                "tooltip": "Single-file Qwen3-ASR checkpoint (see Model Links in README)."}),
         }}
 
     RETURN_TYPES = ("QWEN3ASR",)
@@ -39,8 +39,8 @@ class Qwen3ASRLoader:
                 or "audio_tower.conv2d1.weight" not in sd):
             raise RuntimeError(
                 "ERROR: not a single-file Qwen3-ASR checkpoint. "
-                "Merge the model folder first: "
-                "python convert_qwen3asr_checkpoint.py <model_folder> <out.safetensors>"
+                "Download a pre-converted one: "
+                "https://huggingface.co/Aero-Ex/ComfyUI-Qwen3ASR"
             )
 
         config = json.loads(metadata["qwen3asr.config"])
