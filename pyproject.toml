@@ -1,0 +1,15 @@
+[project]
+name = "ComfyUI-Qwen3ASR-Native"
+description = "Native dependency-free Qwen3-ASR speech-to-text for ComfyUI."
+version = "0.1.0"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.urls]
+Repository = "https://github.com/Aero-Ex/ComfyUI-Qwen3ASR"
+
+[tool.comfy]
+PublisherId = "aerox"
+DisplayName = "Qwen3ASR"
+Icon = ""
