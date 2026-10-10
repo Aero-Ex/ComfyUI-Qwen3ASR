@@ -15,7 +15,7 @@ Restart ComfyUI. No installation needed.
 
 ## Checkpoints
 
-Pre-converted single-file checkpoints: https://huggingface.co/Aero-Ex/ComfyUI-Qwen3ASR
+Pre-converted single-file checkpoints: https://huggingface.co/Aero-Ex/ComfyUI-Qwen3-ASR/tree/main
 
 Download the `qwen3asr` folder contents into `ComfyUI/models/qwen3asr/` (0.6B ASR, 1.7 ASR + optional forced aligner for word timestamps).
 
