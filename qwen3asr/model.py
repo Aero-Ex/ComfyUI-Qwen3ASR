@@ -10,18 +10,8 @@ import comfy.ops
 from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6, device=None, dtype=None):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.empty(dim, device=device, dtype=dtype))
-
-    def forward(self, x):
-        dtype = x.dtype
-        x = x.to(torch.float32)
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return comfy.ops.cast_to_input(self.weight, x).to(dtype) * x.to(dtype)
+def get_rmsnorm_op(operations):
+    return getattr(operations, "RMSNorm", nn.RMSNorm)
 
 
 def precompute_freqs_cis(position_ids, inv_freq, device=None):
@@ -73,8 +63,9 @@ class Qwen3Attention(nn.Module):
         self.k_proj = operations.Linear(hidden_size, self.kv_size, bias=False, device=device, dtype=dtype)
         self.v_proj = operations.Linear(hidden_size, self.kv_size, bias=False, device=device, dtype=dtype)
         self.o_proj = operations.Linear(self.inner_size, hidden_size, bias=False, device=device, dtype=dtype)
-        self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps, device=device, dtype=dtype)
-        self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps, device=device, dtype=dtype)
+        rmsnorm_cls = get_rmsnorm_op(operations)
+        self.q_norm = rmsnorm_cls(head_dim, eps=rms_norm_eps, device=device, dtype=dtype)
+        self.k_norm = rmsnorm_cls(head_dim, eps=rms_norm_eps, device=device, dtype=dtype)
 
     def forward(self, hidden_states, attention_mask=None, freqs_cis=None, past_k=None, past_v=None):
         bsz, q_len, _ = hidden_states.shape
@@ -92,10 +83,18 @@ class Qwen3Attention(nn.Module):
             xk = torch.cat([past_k, xk], dim=2)
             xv = torch.cat([past_v, xv], dim=2)
         new_k, new_v = xk, xv
-        if self.num_heads != self.num_kv_heads:
-            xk, xv = comfy.ops.repeat_kv_for_gqa(xk, xv, self.num_heads, 1)
-        q, k, v = AttentionTensorContainer(xq), AttentionTensorContainer(xk), AttentionTensorContainer(xv)
-        output = optimized_attention(q, k, v, self.num_heads, mask=attention_mask, skip_reshape=True, preferred_attention=self.comfy_attention)
+        if self.num_heads != self.num_kv_heads and attention_mask is None:
+            output = F.scaled_dot_product_attention(xq, xk, xv, enable_gqa=True)
+            output = output.transpose(1, 2).reshape(bsz, q_len, self.inner_size)
+        else:
+            if self.num_heads != self.num_kv_heads:
+                n_rep = self.num_heads // self.num_kv_heads
+                xk_exp = xk.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, self.num_heads, -1, self.head_dim)
+                xv_exp = xv.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, self.num_heads, -1, self.head_dim)
+            else:
+                xk_exp, xv_exp = xk, xv
+            q, k, v = AttentionTensorContainer(xq), AttentionTensorContainer(xk_exp), AttentionTensorContainer(xv_exp)
+            output = optimized_attention(q, k, v, self.num_heads, mask=attention_mask, skip_reshape=True, preferred_attention=self.comfy_attention)
         return self.o_proj(output), new_k, new_v
 
 
@@ -115,8 +114,9 @@ class Qwen3Layer(nn.Module):
         super().__init__()
         self.self_attn = Qwen3Attention(hidden_size, num_heads, num_kv_heads, head_dim, rms_norm_eps, device=device, dtype=dtype, operations=operations)
         self.mlp = Qwen3MLP(hidden_size, intermediate_size, device=device, dtype=dtype, operations=operations)
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
+        rmsnorm_cls = get_rmsnorm_op(operations)
+        self.input_layernorm = rmsnorm_cls(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
+        self.post_attention_layernorm = rmsnorm_cls(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
 
     def forward(self, x, attention_mask=None, freqs_cis=None, past_k=None, past_v=None):
         residual = x
@@ -145,7 +145,7 @@ class Qwen3TextModel(nn.Module):
             Qwen3Layer(self.hidden_size, num_heads, num_kv_heads, head_dim, intermediate_size, rms_norm_eps, device=device, dtype=dtype, operations=operations)
             for _ in range(num_layers)
         ])
-        self.norm = RMSNorm(self.hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
+        self.norm = get_rmsnorm_op(operations)(self.hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
         rope_theta = text_config.get("rope_parameters", {}).get("rope_theta", 1000000)
         rope_inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("rope_inv_freq", rope_inv_freq.to(dtype), persistent=False)
@@ -179,13 +179,19 @@ class AudioAttention(nn.Module):
         self.out_proj = operations.Linear(d_model, d_model, bias=True, device=device, dtype=dtype)
 
     def forward(self, hidden_states):
-        seq_len, _ = hidden_states.shape
-        q = self.q_proj(hidden_states).reshape(seq_len, self.num_heads, -1).transpose(0, 1).unsqueeze(0)
-        k = self.k_proj(hidden_states).reshape(seq_len, self.num_heads, -1).transpose(0, 1).unsqueeze(0)
-        v = self.v_proj(hidden_states).reshape(seq_len, self.num_heads, -1).transpose(0, 1).unsqueeze(0)
+        is_2d = hidden_states.ndim == 2
+        if is_2d:
+            hidden_states = hidden_states.unsqueeze(0)
+        bsz, seq_len, _ = hidden_states.shape
+        q = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         q, k, v = AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v)
         out = optimized_attention(q, k, v, self.num_heads, mask=None, skip_reshape=True, preferred_attention=self.comfy_attention)
-        return self.out_proj(out.reshape(seq_len, -1))
+        out = self.out_proj(out)
+        if is_2d:
+            out = out.squeeze(0)
+        return out
 
 
 class AudioEncoderLayer(nn.Module):
@@ -295,13 +301,27 @@ class AudioTower(nn.Module):
         hidden_states = conv_out.reshape(-1, conv_out.shape[-1])[valid_mask.flatten()]
         lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         splits = torch.split(hidden_states, lengths, dim=0)
-        out_chunks = []
-        for chunk in splits:
-            h = chunk
+        if len(splits) > 0 and all(s.shape[0] == splits[0].shape[0] for s in splits):
+            stacked = torch.stack(splits, dim=0)
             for layer in self.layers:
-                h = layer(h)
-            out_chunks.append(h)
-        hidden_states = torch.cat(out_chunks, dim=0)
+                stacked = layer(stacked)
+            hidden_states = stacked.reshape(-1, stacked.shape[-1])
+        else:
+            main_len = splits[0].shape[0] if len(splits) > 0 else 0
+            main_splits = [s for s in splits if s.shape[0] == main_len]
+            rem_splits = [s for s in splits if s.shape[0] != main_len]
+            out_chunks = []
+            if main_splits:
+                stacked = torch.stack(main_splits, dim=0)
+                for layer in self.layers:
+                    stacked = layer(stacked)
+                out_chunks.extend(list(stacked))
+            for rem in rem_splits:
+                h = rem
+                for layer in self.layers:
+                    h = layer(h)
+                out_chunks.append(h)
+            hidden_states = torch.cat(out_chunks, dim=0)
         hidden_states = self.ln_post(hidden_states)
         return hidden_states
 
@@ -349,7 +369,6 @@ class Qwen3ASRModel(nn.Module):
         inputs_embeds[mask] = audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         return inputs_embeds
 
-    @torch.inference_mode()
     def generate(self, input_ids, audio_embeds, max_new_tokens=512, eos_ids=(151643, 151645), temperature=0.0, callback=None):
         device = input_ids.device
         lm = self.model.language_model
@@ -358,7 +377,7 @@ class Qwen3ASRModel(nn.Module):
         causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
         causal = causal.unsqueeze(0).unsqueeze(0).expand(bsz, 1, seq_len, seq_len)
         hidden, kvs = lm.forward_embeds(inputs_embeds, attention_mask=causal, past_kvs=None, start_pos=0)
-        logit_weight = lm.embed_tokens.weight.to(hidden.device)
+        logit_weight = comfy.ops.cast_to_input(lm.embed_tokens.weight, hidden)
         logits = F.linear(hidden[:, -1:, :], logit_weight)
         out_ids = []
         next_tok = int(logits[0, 0].argmax().item())

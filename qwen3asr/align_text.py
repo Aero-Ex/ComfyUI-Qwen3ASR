@@ -241,7 +241,6 @@ def fix_timestamp(data):
 
 def parse_timestamp(word_list, timestamp):
     timestamp_output = []
-
     timestamp_fixed = fix_timestamp(timestamp)
     for i, word in enumerate(word_list):
         start_time = timestamp_fixed[i * 2]
@@ -251,5 +250,41 @@ def parse_timestamp(word_list, timestamp):
             "start_time": start_time,
             "end_time": end_time
         })
-
     return timestamp_output
+
+
+def join_cues_text(a, b):
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    if (is_cjk_char(a[-1]) or is_kana_char(a[-1])) and (is_cjk_char(b[0]) or is_kana_char(b[0])):
+        return a + b
+    return a + " " + b
+
+
+def format_timestamp(sec):
+    sec = max(0.0, float(sec))
+    total_ms = int(round(sec * 1000.0))
+    ms = total_ms % 1000
+    total_sec = total_ms // 1000
+    s = total_sec % 60
+    total_min = total_sec // 60
+    m = total_min % 60
+    h = total_min // 60
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def format_srt_cues(cues):
+    lines = []
+    for idx, (st, en, tx) in enumerate(cues, 1):
+        tx = (tx or "").strip()
+        if not tx:
+            continue
+        lines.append(str(idx))
+        lines.append(f"{format_timestamp(st)} --> {format_timestamp(en)}")
+        lines.append(tx)
+        lines.append("")
+    return "\n".join(lines).strip() + ("\n" if lines else "")

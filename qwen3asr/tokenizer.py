@@ -265,20 +265,26 @@ def fix_repetitions(text, threshold=20):
     return _fix_pattern_repeats(_fix_char_repeats(text, threshold), threshold)
 
 
-def parse_output(text):
+def parse_output(text, user_language=None):
     if text is None or not str(text).strip():
-        return {"language": None, "transcription": ""}
+        return {"language": user_language or None, "transcription": ""}
     text = str(text).strip()
     if "assistant\n" in text:
         text = text.split("assistant\n", 1)[-1]
     text = fix_repetitions(text)
+    if user_language:
+        # When language is forced, output is treated as pure transcription
+        if "<asr_text>" in text:
+            text = text.split("<asr_text>", 1)[-1]
+        return {"language": user_language, "transcription": text.strip()}
     marker = "<asr_text>"
     if marker not in text:
         return {"language": None, "transcription": text.strip()}
     prefix, transcription = text.split(marker, 1)
     prefix = prefix.strip()
-    if prefix.lower() == "language none":
-        return {"language": None, "transcription": transcription.strip()}
+    # Upstream empty/silent audio heuristic
+    if "language none" in prefix.lower():
+        return {"language": None, "transcription": ""}
     language = None
     for line in prefix.splitlines():
         line = line.strip()
@@ -287,8 +293,8 @@ def parse_output(text):
         if line.lower().startswith("language "):
             val = line[len("language "):].strip()
             if val:
-                language = val
+                language = val[:1].upper() + val[1:].lower()
         else:
-            language = line
+            language = line[:1].upper() + line[1:].lower()
         break
     return {"language": language or None, "transcription": transcription.strip()}

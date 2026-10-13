@@ -10,7 +10,7 @@ import torch
 
 from .qwen3asr.features import extract_input_features, audio_token_length
 from .qwen3asr.align_model import Qwen3AlignerModel
-from .qwen3asr.align_text import encode_timestamp, parse_timestamp
+from .qwen3asr.align_text import encode_timestamp, parse_timestamp, format_timestamp, format_srt_cues
 from .qwen3asr.tokenizer import QwenBpeTokenizer
 
 
@@ -58,7 +58,8 @@ class Qwen3AlignerLoader:
         model.aligner_config = config
         load_device = comfy.model_management.get_torch_device()
         offload_device = comfy.model_management.unet_offload_device()
-        patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device)
+        size = comfy.model_management.module_size(model.model)
+        patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device, size=size)
         return (patcher,)
 
 
@@ -78,18 +79,7 @@ class Qwen3ForcedAlign:
     FUNCTION = "execute"
     CATEGORY = "Qwen3ASR"
 
-    @staticmethod
-    def _format_timestamp(sec):
-        sec = max(0.0, float(sec))
-        ms = int(round((sec - int(sec)) * 1000.0))
-        total = int(sec)
-        if ms == 1000:
-            total += 1
-            ms = 0
-        h, rem = divmod(total, 3600)
-        m, s = divmod(rem, 60)
-        return "{:02d}:{:02d}:{:02d},{:03d}".format(h, m, s, ms)
-
+    _format_timestamp = staticmethod(format_timestamp)
     def align_mono(self, wrapper, tokenizer, mono, text, language, load_device, target_dtype):
         max_sec = wrapper.num_classes * wrapper.timestamp_segment_time / 1000.0
         if mono.shape[0] / 16000.0 > max_sec:
@@ -107,9 +97,8 @@ class Qwen3ForcedAlign:
         feats = feats.to(load_device, dtype=target_dtype)
         mask = mask.to(load_device)
         ids = ids.to(load_device)
-        with torch.inference_mode():
-            audio_embeds = wrapper.model.get_audio_features(feats, mask)
-            logits = wrapper.align_logits(ids, audio_embeds.reshape(-1, audio_embeds.shape[-1]))
+        audio_embeds = wrapper.model.get_audio_features(feats, mask)
+        logits = wrapper.align_logits(ids, audio_embeds.reshape(-1, audio_embeds.shape[-1]))
         pred = logits[0].argmax(dim=-1)
         ts_id = wrapper.timestamp_token_id
         ts_idx = (ids[0] == ts_id).nonzero(as_tuple=True)[0]
@@ -135,6 +124,9 @@ class Qwen3ForcedAlign:
             waveform = waveform.mean(dim=1, keepdim=True)
         if sr != 16000:
             waveform = comfy.audio.resample(waveform, sr, 16000)
+        peak = float(waveform.abs().max().item())
+        if peak > 1.0:
+            waveform = waveform / peak
         texts = [transcription] * waveform.shape[0] if isinstance(transcription, str) else list(transcription)
         try:
             target_dtype = getattr(wrapper, "dtype", None) or torch.bfloat16
@@ -150,13 +142,8 @@ class Qwen3ForcedAlign:
         srts = []
         for items in out:
             strs.append(json.dumps(items, ensure_ascii=False))
-            lines = []
-            for i, it in enumerate(items):
-                lines.append(str(i + 1))
-                lines.append("{} --> {}".format(self._format_timestamp(it["start"]), self._format_timestamp(it["end"])))
-                lines.append(it["text"])
-                lines.append("")
-            srts.append("\n".join(lines).strip() + ("\n" if lines else ""))
+            cues = [(it["start"], it["end"], it["text"]) for it in items]
+            srts.append(format_srt_cues(cues))
         if len(out) == 1:
             return (strs[0], srts[0])
         return (strs, srts)

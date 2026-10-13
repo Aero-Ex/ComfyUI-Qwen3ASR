@@ -9,7 +9,7 @@ import comfy.ops
 import torch
 
 from .qwen3asr.features import extract_input_features, audio_token_length
-from .qwen3asr.align_text import is_cjk_char, is_kana_char
+from .qwen3asr.align_text import is_cjk_char, is_kana_char, join_cues_text, format_timestamp, format_srt_cues
 from .qwen3asr.model import Qwen3ASRModel
 from .qwen3asr.prompt import build_prompt_text, resolve_language
 from .qwen3asr.tokenizer import QwenBpeTokenizer, parse_output
@@ -58,7 +58,8 @@ class Qwen3ASRLoader:
         model.asr_config = config
         load_device = comfy.model_management.get_torch_device()
         offload_device = comfy.model_management.unet_offload_device()
-        patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device)
+        size = comfy.model_management.module_size(model.model)
+        patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device, size=size)
         return (patcher,)
 
 
@@ -85,98 +86,88 @@ class Qwen3ASRTranscribe:
     FUNCTION = "execute"
     CATEGORY = "Qwen3ASR"
 
-    @staticmethod
-    def _format_timestamp(sec):
-        sec = max(0.0, float(sec))
-        ms = int(round((sec - int(sec)) * 1000.0))
-        total = int(sec)
-        if ms == 1000:
-            total += 1
-            ms = 0
-        h, rem = divmod(total, 3600)
-        m, s = divmod(rem, 60)
-        return "{:02d}:{:02d}:{:02d},{:03d}".format(h, m, s, ms)
+    _format_timestamp = staticmethod(format_timestamp)
 
-    def _split_chunks(self, wav, sr, max_sec, expand_sec=5.0, win_ms=100.0, min_silence_ms=500.0):
-        total = wav.shape[0]
-        max_len = int(max_sec * sr)
-        if total / float(sr) <= max_sec:
+    @staticmethod
+    def _split_sentences(text):
+        import re
+        text = (text or "").strip()
+        if not text:
+            return []
+        parts = re.split(r'([.!?。\n\r]+|\s*\n+\s*)', text)
+        sents = []
+        buf = ""
+        for p in parts:
+            buf += p
+            if re.search(r'[.!?。\n\r]$', buf):
+                s = buf.strip()
+                if s:
+                    sents.append(s)
+                buf = ""
+        if buf.strip():
+            sents.append(buf.strip())
+        return sents if sents else [text]
+
+    def _split_chunks(self, wav, sr, max_sec, search_expand_sec=5.0, min_window_ms=100.0):
+        total_len = wav.shape[0]
+        if total_len / float(sr) <= max_sec:
+            min_len = int(0.5 * sr)
+            if total_len < min_len:
+                pad = min_len - total_len
+                wav = torch.nn.functional.pad(wav, (0, pad))
             return [(wav, 0.0)]
-        expand = int(expand_sec * sr)
-        win = max(4, int(win_ms / 1000.0 * sr))
+        max_len = int(max_sec * sr)
+        expand = int(search_expand_sec * sr)
+        win = max(4, int((min_window_ms / 1000.0) * sr))
         chunks = []
         start = 0
-        offset = 0.0
-        while total - start > max_len:
+        offset_sec = 0.0
+        while (total_len - start) > max_len:
             cut = start + max_len
             left = max(start, cut - expand)
-            right = min(total, cut + expand)
+            right = min(total_len, cut + expand)
             if right - left <= win:
                 boundary = cut
             else:
-                seg = wav[left:right].abs()
-                cs = torch.cumsum(seg, dim=0)
-                padded = torch.cat([seg.new_zeros(1), cs])
-                sums = padded[win:] - padded[:-win]
-                # Prefer a sustained silence (>= min_silence_ms, toolkit-style
-                # min_silence_duration_ms=500) nearest the target cut; fall
-                # back to the global lowest-energy window.
-                n_win = sums.shape[0]
-                med = float(sums.median().item())
-                floor = float(sums.quantile(0.05).item())
-                span = med - floor
-                min_sil = max(1, int(min_silence_ms / win_ms))
-                center = (cut - left) / float(max(1, right - left)) * n_win
-                if span <= max(1e-9, med * 1e-3):
-                    # Flat dynamics (all loud or all silent): no true silence
-                    # info, cut at the lowest-energy window.
-                    rel = int(sums.argmin().item())
-                else:
-                    thresh = floor + span * 0.25
-                    mask = sums <= thresh
-                    mpad = torch.cat([mask.new_zeros(1), mask, mask.new_zeros(1)]).to(torch.int8)
-                    trans = mpad[1:] - mpad[:-1]
-                    starts = (trans == 1).nonzero(as_tuple=True)[0]
-                    ends = (trans == -1).nonzero(as_tuple=True)[0]
-                    lengths = ends - starts
-                    keep = lengths >= min_sil
-                    if bool(keep.any().item()):
-                        starts = starts[keep]
-                        ends = ends[keep]
-                        mids = (starts.to(torch.float64) + ends.to(torch.float64)) / 2.0
-                        pick = int((mids - center).abs().argmin().item())
-                        rs = int(starts[pick].item())
-                        re = int(ends[pick].item())
-                        rel = rs + int(sums[rs:re].argmin().item())
-                    else:
-                        rel = int(sums.argmin().item())
-                inner = int(seg[rel:rel + win].argmin().item())
-                boundary = left + rel + inner
-            boundary = max(boundary, start + 1)
-            boundary = min(boundary, total)
-            chunks.append((wav[start:boundary], offset))
-            offset += (boundary - start) / float(sr)
+                seg_abs = wav[left:right].abs()
+                cs = torch.cumsum(seg_abs, dim=0)
+                padded = torch.cat([seg_abs.new_zeros(1), cs])
+                window_sums = padded[win:] - padded[:-win]
+                min_pos = int(torch.argmin(window_sums).item())
+                local = seg_abs[min_pos:min_pos + win]
+                inner = int(torch.argmin(local).item())
+                boundary = left + min_pos + inner
+            boundary = int(max(boundary, start + 1))
+            boundary = int(min(boundary, total_len))
+            chunk = wav[start:boundary]
+            chunks.append((chunk, offset_sec))
+            offset_sec += (boundary - start) / float(sr)
             start = boundary
-        chunks.append((wav[start:total], offset))
-        return chunks
+        tail = wav[start:total_len]
+        chunks.append((tail, offset_sec))
+        min_len = int(0.5 * sr)
+        padded_chunks = []
+        for c, off in chunks:
+            if c.shape[0] < min_len:
+                pad = min_len - c.shape[0]
+                c = torch.nn.functional.pad(c, (0, pad))
+            padded_chunks.append((c, off))
+        return padded_chunks
 
     @staticmethod
     def _cue_text(words):
         out = ""
         for w in words:
-            if (out and len(w) == 1 and (is_cjk_char(w) or is_kana_char(w))
-                    and (is_cjk_char(out[-1]) or is_kana_char(out[-1]))):
-                out += w
-            else:
-                out = w if not out else out + " " + w
+            out = join_cues_text(out, w)
         return out
 
     @staticmethod
-    def _group_word_cues(wlines, max_words=8, max_gap=0.6, max_chars=84):
+    def _group_word_cues(wlines, max_words=8, max_gap=0.6, max_chars=84, min_dur=0.2):
+        words = [(st, max(en, st + 0.05), tx) for st, en, tx in wlines if tx]
         cues = []
         cur = []
         cur_len = 0
-        for st, en, tx in wlines:
+        for st, en, tx in words:
             if cur and (len(cur) >= max_words or cur_len + 1 + len(tx) > max_chars
                     or st - cur[-1][1] > max_gap):
                 cues.append((cur[0][0], cur[-1][1], Qwen3ASRTranscribe._cue_text([w[2] for w in cur])))
@@ -186,22 +177,41 @@ class Qwen3ASRTranscribe:
             cur_len += len(tx) + (1 if cur_len else 0)
         if cur:
             cues.append((cur[0][0], cur[-1][1], Qwen3ASRTranscribe._cue_text([w[2] for w in cur])))
-        return cues
+        out = []
+        i = 0
+        while i < len(cues):
+            st, en, tx = cues[i]
+            if en <= st:
+                en = st + min_dur
+            want = st + min_dur
+            if i + 1 < len(cues):
+                nxt = cues[i + 1][0]
+                cap = nxt - 0.04
+                if want > cap:
+                    if cap <= st + 0.2:
+                        nst, nen, ntx = cues[i + 1]
+                        cues[i + 1] = (st, max(nen, en), join_cues_text(tx, ntx))
+                        i += 1
+                        continue
+                    en = max(en, cap)
+                else:
+                    en = max(en, want)
+            else:
+                en = max(en, want)
+            out.append((st, en, tx))
+            i += 1
+        return out
 
     def _transcribe_parts(self, wrapper, tokenizer, lang, system_prompt, parts, max_new_tokens, temperature, load_device, target_dtype, pbar, base):
         texts = []
         langs = []
         chunk_langs = []
-        prev_tail = ""
+        eff_system = system_prompt or ""
         for ci, (cwav, coff) in enumerate(parts):
             comfy.model_management.throw_exception_if_processing_interrupted()
             feats, mask = extract_input_features(cwav)
             n_tok = int(audio_token_length(mask.sum(-1)).item())
             prefill = "language {}<asr_text>".format(lang) if lang else ""
-            eff_system = system_prompt or ""
-            if prev_tail:
-                ctx = "Previous transcript:\n" + prev_tail
-                eff_system = eff_system + "\n" + ctx if eff_system else ctx
             prompt_text = build_prompt_text(eff_system, n_tok, prefill)
             ids = torch.tensor([tokenizer._encode_str(prompt_text)], dtype=torch.long)
             feats = feats.to(load_device, dtype=target_dtype)
@@ -213,17 +223,14 @@ class Qwen3ASRTranscribe:
                 pbar.update_absolute(b + s)
                 comfy.model_management.throw_exception_if_processing_interrupted()
 
-            with torch.inference_mode():
-                audio_embeds = wrapper.model.get_audio_features(feats, mask)
-                out_ids = wrapper.generate(ids, audio_embeds.reshape(-1, audio_embeds.shape[-1]), max_new_tokens=max_new_tokens, temperature=temperature, callback=_cb)
+            audio_embeds = wrapper.model.get_audio_features(feats, mask)
+            out_ids = wrapper.generate(ids, audio_embeds.reshape(-1, audio_embeds.shape[-1]), max_new_tokens=max_new_tokens, temperature=temperature, callback=_cb)
             raw = tokenizer.decode_ids(out_ids, skip_special_tokens=True)
             if prefill and "<asr_text>" not in raw:
                 raw = prefill + raw
-            parsed = parse_output(raw)
+            parsed = parse_output(raw, user_language=lang)
             texts.append(parsed["transcription"])
             chunk_langs.append(parsed["language"])
-            if parsed["transcription"].strip():
-                prev_tail = parsed["transcription"].strip()[-200:]
             if parsed["language"]:
                 langs.append(parsed["language"])
             del feats, mask, ids, audio_embeds, out_ids
@@ -236,18 +243,25 @@ class Qwen3ASRTranscribe:
                 continue
             merged_lang = x if not merged_lang else merged_lang + "," + x
             prev = x
-        lines = []
+        chunk_cues = []
         for (cwav, coff), text in zip(parts, texts):
             body = (text or "").strip()
             if not body:
                 continue
             start = float(coff)
-            end = start + float(cwav.shape[0]) / 16000.0
-            lines.append(str(len(lines) + 1))
-            lines.append("{} --> {}".format(self._format_timestamp(start), self._format_timestamp(end)))
-            lines.append(body)
-            lines.append("")
-        srt = "\n".join(lines).strip() + ("\n" if lines else "")
+            chunk_dur = float(cwav.shape[0]) / 16000.0
+            sents = self._split_sentences(body)
+            total_chars = max(1, sum(len(s) for s in sents))
+            cur_st = start
+            for s in sents:
+                frac = len(s) / total_chars
+                sent_dur = max(0.4, chunk_dur * frac)
+                cur_en = min(start + chunk_dur, cur_st + sent_dur)
+                if cur_en <= cur_st:
+                    cur_en = cur_st + 0.4
+                chunk_cues.append((cur_st, cur_en, s))
+                cur_st = cur_en
+        srt = format_srt_cues(chunk_cues)
         return (merged, merged_lang or (lang or ""), srt, texts, chunk_langs)
 
     def execute(self, model, audio, max_new_tokens=512, temperature=0.0, language="", system_prompt="", chunk_seconds=60.0, aligner=None, srt_max_words=8, srt_max_chars=84, srt_max_gap=0.6):
@@ -274,6 +288,9 @@ class Qwen3ASRTranscribe:
             waveform = waveform.mean(dim=1, keepdim=True)
         if sr != 16000:
             waveform = comfy.audio.resample(waveform, sr, 16000)
+        peak = float(waveform.abs().max().item())
+        if peak > 1.0:
+            waveform = waveform / peak
         monos = [waveform[b].reshape(-1).to(torch.float32).cpu() for b in range(waveform.shape[0])]
         try:
             align_node = Qwen3ForcedAlign() if awrapper is not None else None
@@ -295,24 +312,10 @@ class Qwen3ASRTranscribe:
                         items = align_node.align_mono(awrapper, atokenizer, cwav, text, clang or lang or merged_lang or "English", load_device, atarget)
                         for it in items:
                             wlines.append((coff + it["start"], coff + it["end"], it["text"]))
-                    lines = []
-                    for i, (st, en, tx) in enumerate(wlines):
-                        lines.append(str(i + 1))
-                        lines.append("{} --> {}".format(
-                            Qwen3ForcedAlign._format_timestamp(st), Qwen3ForcedAlign._format_timestamp(en)))
-                        lines.append(tx)
-                        lines.append("")
-                    word_srts.append("\n".join(lines).strip() + ("\n" if lines else ""))
+                    word_srts.append(format_srt_cues(wlines))
                     cues = self._group_word_cues(wlines, max_words=int(srt_max_words), max_gap=float(srt_max_gap), max_chars=int(srt_max_chars))
-                    clines = []
-                    for i, (st, en, tx) in enumerate(cues):
-                        clines.append(str(i + 1))
-                        clines.append("{} --> {}".format(
-                            Qwen3ForcedAlign._format_timestamp(st), Qwen3ForcedAlign._format_timestamp(en)))
-                        clines.append(tx)
-                        clines.append("")
-                    if clines:
-                        srt = "\n".join(clines).strip() + "\n"
+                    if cues:
+                        srt = format_srt_cues(cues)
                 else:
                     word_srts.append("")
                 out.append((merged, merged_lang, srt))

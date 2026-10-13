@@ -41,7 +41,6 @@ class Qwen3AlignerModel(nn.Module):
         inputs_embeds[mask] = audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         return inputs_embeds
 
-    @torch.inference_mode()
     def align_logits(self, input_ids, audio_embeds):
         inputs_embeds = self.embed_merged(input_ids, audio_embeds)
         bsz, seq_len, _ = inputs_embeds.shape
