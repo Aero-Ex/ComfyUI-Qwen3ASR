@@ -1,6 +1,6 @@
 # ComfyUI-Qwen3ASR
 
-Native, dependency-free Qwen3-ASR speech-to-text for ComfyUI.
+dependency-free Qwen3-ASR speech-to-text for ComfyUI.
 
 ## Install
 

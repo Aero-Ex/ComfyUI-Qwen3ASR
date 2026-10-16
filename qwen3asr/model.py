@@ -1,169 +1,20 @@
 import math
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import comfy.model_management
-import comfy.ops
+import comfy.model_prefetch
 from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
+from comfy.text_encoders.llama import BaseGenerate, BaseQwen3, Llama2_, Qwen3_06BConfig
+
+from .features import CHUNK_FRAMES, conv_output_length
 
 
-def get_rmsnorm_op(operations):
-    return getattr(operations, "RMSNorm", nn.RMSNorm)
-
-
-def precompute_freqs_cis(position_ids, inv_freq, device=None):
-    inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-    if device is not None:
-        inv_freq_expanded = inv_freq_expanded.to(device)
-    position_ids_expanded = position_ids[:, None, :].float()
-    freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    cos = emb.cos()
-    sin = emb.sin()
-    return cos.unsqueeze(1), sin.unsqueeze(1)
-
-
-def apply_rope(xq, xk, freqs_cis):
-    cos, sin = freqs_cis
-    cos = cos.to(dtype=xq.dtype, device=xq.device)
-    sin = sin.to(dtype=xq.dtype, device=xq.device)
-
-    def rotate_half(x):
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2:]
-        return torch.cat((-x2, x1), dim=-1)
-
-    q_ndim, k_ndim = xq.ndim, xk.ndim
-    if q_ndim == 3:
-        xq = xq.unsqueeze(0)
-    if k_ndim == 3:
-        xk = xk.unsqueeze(0)
-    xq = (xq * cos) + (rotate_half(xq) * sin)
-    xk = (xk * cos) + (rotate_half(xk) * sin)
-    if q_ndim == 3:
-        xq = xq.squeeze(0)
-    if k_ndim == 3:
-        xk = xk.squeeze(0)
-    return xq, xk
-
-
-class Qwen3Attention(nn.Module):
-    def __init__(self, hidden_size, num_heads, num_kv_heads, head_dim, rms_norm_eps, device=None, dtype=None, operations=None):
-        super().__init__()
-        self.comfy_attention = ComfyAttention()
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-        self.inner_size = num_heads * head_dim
-        self.kv_size = num_kv_heads * head_dim
-        self.q_proj = operations.Linear(hidden_size, self.inner_size, bias=False, device=device, dtype=dtype)
-        self.k_proj = operations.Linear(hidden_size, self.kv_size, bias=False, device=device, dtype=dtype)
-        self.v_proj = operations.Linear(hidden_size, self.kv_size, bias=False, device=device, dtype=dtype)
-        self.o_proj = operations.Linear(self.inner_size, hidden_size, bias=False, device=device, dtype=dtype)
-        rmsnorm_cls = get_rmsnorm_op(operations)
-        self.q_norm = rmsnorm_cls(head_dim, eps=rms_norm_eps, device=device, dtype=dtype)
-        self.k_norm = rmsnorm_cls(head_dim, eps=rms_norm_eps, device=device, dtype=dtype)
-
-    def forward(self, hidden_states, attention_mask=None, freqs_cis=None, past_k=None, past_v=None):
-        bsz, q_len, _ = hidden_states.shape
-        xq = self.q_proj(hidden_states)
-        xk = self.k_proj(hidden_states)
-        xv = self.v_proj(hidden_states)
-        xq = xq.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        xk = xk.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        xv = xv.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        xq = self.q_norm(xq)
-        xk = self.k_norm(xk)
-        if freqs_cis is not None:
-            xq, xk = apply_rope(xq, xk, freqs_cis)
-        if past_k is not None and past_v is not None:
-            xk = torch.cat([past_k, xk], dim=2)
-            xv = torch.cat([past_v, xv], dim=2)
-        new_k, new_v = xk, xv
-        if self.num_heads != self.num_kv_heads and attention_mask is None:
-            output = F.scaled_dot_product_attention(xq, xk, xv, enable_gqa=True)
-            output = output.transpose(1, 2).reshape(bsz, q_len, self.inner_size)
-        else:
-            if self.num_heads != self.num_kv_heads:
-                n_rep = self.num_heads // self.num_kv_heads
-                xk_exp = xk.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, self.num_heads, -1, self.head_dim)
-                xv_exp = xv.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, self.num_heads, -1, self.head_dim)
-            else:
-                xk_exp, xv_exp = xk, xv
-            q, k, v = AttentionTensorContainer(xq), AttentionTensorContainer(xk_exp), AttentionTensorContainer(xv_exp)
-            output = optimized_attention(q, k, v, self.num_heads, mask=attention_mask, skip_reshape=True, preferred_attention=self.comfy_attention)
-        return self.o_proj(output), new_k, new_v
-
-
-class Qwen3MLP(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, device=None, dtype=None, operations=None):
-        super().__init__()
-        self.gate_proj = operations.Linear(hidden_size, intermediate_size, bias=False, device=device, dtype=dtype)
-        self.up_proj = operations.Linear(hidden_size, intermediate_size, bias=False, device=device, dtype=dtype)
-        self.down_proj = operations.Linear(intermediate_size, hidden_size, bias=False, device=device, dtype=dtype)
-
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-class Qwen3Layer(nn.Module):
-    def __init__(self, hidden_size, num_heads, num_kv_heads, head_dim, intermediate_size, rms_norm_eps, device=None, dtype=None, operations=None):
-        super().__init__()
-        self.self_attn = Qwen3Attention(hidden_size, num_heads, num_kv_heads, head_dim, rms_norm_eps, device=device, dtype=dtype, operations=operations)
-        self.mlp = Qwen3MLP(hidden_size, intermediate_size, device=device, dtype=dtype, operations=operations)
-        rmsnorm_cls = get_rmsnorm_op(operations)
-        self.input_layernorm = rmsnorm_cls(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
-        self.post_attention_layernorm = rmsnorm_cls(hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
-
-    def forward(self, x, attention_mask=None, freqs_cis=None, past_k=None, past_v=None):
-        residual = x
-        x = self.input_layernorm(x)
-        x, new_k, new_v = self.self_attn(x, attention_mask=attention_mask, freqs_cis=freqs_cis, past_k=past_k, past_v=past_v)
-        x = residual + x
-        residual = x
-        x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
-        return residual + x, new_k, new_v
-
-
-class Qwen3TextModel(nn.Module):
-    def __init__(self, text_config, device=None, dtype=None, operations=None):
-        super().__init__()
-        self.hidden_size = text_config.get("hidden_size", 1024)
-        num_layers = text_config.get("num_hidden_layers", 28)
-        num_heads = text_config.get("num_attention_heads", 16)
-        num_kv_heads = text_config.get("num_key_value_heads", 8)
-        head_dim = text_config.get("head_dim", 128)
-        intermediate_size = text_config.get("intermediate_size", 3072)
-        rms_norm_eps = text_config.get("rms_norm_eps", 1e-6)
-        vocab_size = text_config.get("vocab_size", 151936)
-        self.embed_tokens = operations.Embedding(vocab_size, self.hidden_size, device=device, dtype=dtype)
-        self.layers = nn.ModuleList([
-            Qwen3Layer(self.hidden_size, num_heads, num_kv_heads, head_dim, intermediate_size, rms_norm_eps, device=device, dtype=dtype, operations=operations)
-            for _ in range(num_layers)
-        ])
-        self.norm = get_rmsnorm_op(operations)(self.hidden_size, eps=rms_norm_eps, device=device, dtype=dtype)
-        rope_theta = text_config.get("rope_parameters", {}).get("rope_theta", 1000000)
-        rope_inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
-        self.register_buffer("rope_inv_freq", rope_inv_freq.to(dtype), persistent=False)
-
-    def forward_embeds(self, inputs_embeds, attention_mask=None, past_kvs=None, start_pos=0):
-        bsz, seq_len, _ = inputs_embeds.shape
-        device = inputs_embeds.device
-        position_ids = torch.arange(start_pos, start_pos + seq_len, device=device).unsqueeze(0)
-        freqs_cis = precompute_freqs_cis(position_ids, self.rope_inv_freq, inputs_embeds.device)
-        x = inputs_embeds
-        new_kvs = []
-        for i, layer in enumerate(self.layers):
-            pk, pv = (None, None)
-            if past_kvs is not None:
-                pk, pv = past_kvs[i]
-            x, nk, nv = layer(x, attention_mask=attention_mask, freqs_cis=freqs_cis, past_k=pk, past_v=pv)
-            new_kvs.append((nk, nv))
-        return self.norm(x), new_kvs
+def sinusoids(length, channels, device):
+    inv_timescales = torch.exp(-math.log(10000) / (channels // 2 - 1) * torch.arange(channels // 2, device=device, dtype=torch.float32))
+    scaled_time = torch.arange(length, device=device, dtype=torch.float32)[:, None] * inv_timescales[None, :]
+    return torch.cat([scaled_time.sin(), scaled_time.cos()], dim=1)
 
 
 class AudioAttention(nn.Module):
@@ -172,26 +23,18 @@ class AudioAttention(nn.Module):
         self.comfy_attention = ComfyAttention()
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-        self.scaling = self.head_dim ** -0.5
-        self.q_proj = operations.Linear(d_model, d_model, bias=True, device=device, dtype=dtype)
-        self.k_proj = operations.Linear(d_model, d_model, bias=True, device=device, dtype=dtype)
-        self.v_proj = operations.Linear(d_model, d_model, bias=True, device=device, dtype=dtype)
-        self.out_proj = operations.Linear(d_model, d_model, bias=True, device=device, dtype=dtype)
+        self.q_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.k_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.v_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
+        self.out_proj = operations.Linear(d_model, d_model, device=device, dtype=dtype)
 
-    def forward(self, hidden_states):
-        is_2d = hidden_states.ndim == 2
-        if is_2d:
-            hidden_states = hidden_states.unsqueeze(0)
-        bsz, seq_len, _ = hidden_states.shape
-        q = self.q_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        q, k, v = AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v)
-        out = optimized_attention(q, k, v, self.num_heads, mask=None, skip_reshape=True, preferred_attention=self.comfy_attention)
-        out = self.out_proj(out)
-        if is_2d:
-            out = out.squeeze(0)
-        return out
+    def forward(self, x):
+        b, n, _ = x.shape
+        q = self.q_proj(x).view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+        out = optimized_attention(AttentionTensorContainer(q), AttentionTensorContainer(k), AttentionTensorContainer(v), self.num_heads, skip_reshape=True, preferred_attention=self.comfy_attention)
+        return self.out_proj(out)
 
 
 class AudioEncoderLayer(nn.Module):
@@ -203,200 +46,110 @@ class AudioEncoderLayer(nn.Module):
         self.fc2 = operations.Linear(ffn_dim, d_model, device=device, dtype=dtype)
         self.final_layer_norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
 
-    def forward(self, hidden_states):
-        residual = hidden_states
-        hidden_states = self.self_attn(self.self_attn_layer_norm(hidden_states))
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc1(hidden_states)
-        hidden_states = F.gelu(hidden_states)
-        hidden_states = self.fc2(hidden_states)
-        hidden_states = residual + hidden_states
-        if hidden_states.dtype == torch.float16:
-            clamp_value = torch.finfo(hidden_states.dtype).max - 1000
-            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
-        return hidden_states
-
-
-def _feat_extract_output_lengths(input_lengths, n_window=50):
-    chunk_len = n_window * 2
-    leave = input_lengths % chunk_len
-    feat_lengths = (leave - 1) // 2 + 1
-    return ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // chunk_len) * 13
-
-
-def _post_cnn_length(lengths):
-    for _ in range(3):
-        lengths = torch.where(lengths > 0, (lengths - 1) // 2 + 1, torch.zeros_like(lengths))
-    return lengths
-
-
-def get_audio_cu_seqlens(chunk_lengths, feature_lens, n_window_infer, n_window):
-    aftercnn_lens = _feat_extract_output_lengths(feature_lens, n_window)
-    feature_lens_after_cnn = _feat_extract_output_lengths(chunk_lengths, n_window)
-    max_len_after_cnn = int(feature_lens_after_cnn.max().item())
-    n_window_ratio = n_window_infer // (n_window * 2)
-    window_aftercnn = max_len_after_cnn * n_window_ratio
-    cu_chunk_lens = [0]
-    for cnn_len in aftercnn_lens.tolist():
-        cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
-        remainder = cnn_len % window_aftercnn
-        if remainder != 0:
-            cu_chunk_lens += [remainder]
-    return torch.tensor(cu_chunk_lens, device=feature_lens.device).cumsum(-1, dtype=torch.int32)
+    def forward(self, x):
+        x = x + self.self_attn(self.self_attn_layer_norm(x))
+        return x + self.fc2(F.gelu(self.fc1(self.final_layer_norm(x))))
 
 
 class AudioTower(nn.Module):
-    def __init__(self, audio_config, device=None, dtype=None, operations=None):
+    def __init__(self, config, device=None, dtype=None, operations=None):
         super().__init__()
-        d_model = audio_config.get("d_model", 896)
-        self.n_window = audio_config.get("n_window", 50)
-        self.n_window_infer = audio_config.get("n_window_infer", 800)
-        num_mel_bins = audio_config.get("num_mel_bins", 128)
-        down_hidden = audio_config.get("downsample_hidden_size", 480)
-        num_layers = audio_config.get("encoder_layers", 18)
-        num_heads = audio_config.get("encoder_attention_heads", 14)
-        ffn_dim = audio_config.get("encoder_ffn_dim", 3584)
-        self.d_model = d_model
-        self.conv2d1 = operations.Conv2d(1, down_hidden, 3, 2, padding=1, device=device, dtype=dtype)
-        self.conv2d2 = operations.Conv2d(down_hidden, down_hidden, 3, 2, padding=1, device=device, dtype=dtype)
-        self.conv2d3 = operations.Conv2d(down_hidden, down_hidden, 3, 2, padding=1, device=device, dtype=dtype)
-        freq_bins = num_mel_bins
-        for _ in range(3):
-            freq_bins = (freq_bins + 2 - 3) // 2 + 1
-        self.conv_out = operations.Linear(down_hidden * freq_bins, d_model, bias=False, device=device, dtype=dtype)
-        length, channels = 13, d_model
-        log_timescale = math.log(10000) / (channels // 2 - 1)
-        inv_timescales = torch.exp(-log_timescale * torch.arange(channels // 2).float())
-        scaled_time = torch.arange(length)[:, None] * inv_timescales[None, :]
-        pos_emb = torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
-        self.register_buffer("positional_embedding", pos_emb.to(dtype), persistent=False)
-        self.layers = nn.ModuleList([
-            AudioEncoderLayer(d_model, num_heads, ffn_dim, device=device, dtype=dtype, operations=operations)
-            for _ in range(num_layers)
-        ])
+        d_model = config["d_model"]
+        hidden = config["downsample_hidden_size"]
+        self.window_chunks = config["n_window_infer"] // CHUNK_FRAMES
+        self.conv2d1 = operations.Conv2d(1, hidden, 3, 2, padding=1, device=device, dtype=dtype)
+        self.conv2d2 = operations.Conv2d(hidden, hidden, 3, 2, padding=1, device=device, dtype=dtype)
+        self.conv2d3 = operations.Conv2d(hidden, hidden, 3, 2, padding=1, device=device, dtype=dtype)
+        self.conv_out = operations.Linear(hidden * conv_output_length(config["num_mel_bins"]), d_model, bias=False, device=device, dtype=dtype)
+        self.layers = nn.ModuleList([AudioEncoderLayer(d_model, config["encoder_attention_heads"], config["encoder_ffn_dim"], device=device, dtype=dtype, operations=operations)
+                                     for _ in range(config["encoder_layers"])])
         self.ln_post = operations.LayerNorm(d_model, device=device, dtype=dtype)
 
-    def forward(self, input_features, input_features_mask):
-        batch_size, _, padded_len = input_features.shape
-        chunk_len = self.n_window * 2
-        num_chunks = padded_len // chunk_len
-        feature_lens = input_features_mask.sum(-1).to(torch.long)
-        chunk_lengths = input_features_mask.view(batch_size, num_chunks, chunk_len).sum(dim=-1).reshape(-1).to(torch.long)
-        cu_seqlens = get_audio_cu_seqlens(chunk_lengths, feature_lens, self.n_window_infer, self.n_window)
-        chunked = input_features.view(batch_size, -1, num_chunks, chunk_len).permute(0, 2, 1, 3).reshape(batch_size * num_chunks, 1, -1, chunk_len)
-        conv_outs = []
-        for i in range(0, chunked.shape[0], 32):
-            h = F.gelu(self.conv2d1(chunked[i:i + 32]))
+    def forward(self, features, num_frames):
+        """features: [1, mel, frames padded to CHUNK_FRAMES] -> [audio tokens, d_model]."""
+        chunks = features[0].unflatten(-1, (-1, CHUNK_FRAMES)).transpose(0, 1).unsqueeze(1)
+        x = []
+        for i in range(0, chunks.shape[0], 32):
+            h = F.gelu(self.conv2d1(chunks[i:i + 32]))
             h = F.gelu(self.conv2d2(h))
-            h = F.gelu(self.conv2d3(h))
-            conv_outs.append(h)
-        conv_out = torch.cat(conv_outs, dim=0)
-        total_chunks, _, _, time_steps = conv_out.size()
-        conv_out = self.conv_out(conv_out.permute(0, 3, 1, 2).contiguous().view(total_chunks, time_steps, -1))
-        conv_out = conv_out + self.positional_embedding[:time_steps].to(device=conv_out.device, dtype=conv_out.dtype)
-        chunk_post_lens = _post_cnn_length(input_features_mask.view(batch_size, num_chunks, chunk_len).sum(dim=-1).reshape(-1).to(torch.long))
-        valid_mask = torch.arange(time_steps, device=input_features.device).unsqueeze(0) < chunk_post_lens.unsqueeze(1)
-        hidden_states = conv_out.reshape(-1, conv_out.shape[-1])[valid_mask.flatten()]
-        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        splits = torch.split(hidden_states, lengths, dim=0)
-        if len(splits) > 0 and all(s.shape[0] == splits[0].shape[0] for s in splits):
-            stacked = torch.stack(splits, dim=0)
-            for layer in self.layers:
-                stacked = layer(stacked)
-            hidden_states = stacked.reshape(-1, stacked.shape[-1])
-        else:
-            main_len = splits[0].shape[0] if len(splits) > 0 else 0
-            main_splits = [s for s in splits if s.shape[0] == main_len]
-            rem_splits = [s for s in splits if s.shape[0] != main_len]
-            out_chunks = []
-            if main_splits:
-                stacked = torch.stack(main_splits, dim=0)
-                for layer in self.layers:
-                    stacked = layer(stacked)
-                out_chunks.extend(list(stacked))
-            for rem in rem_splits:
-                h = rem
-                for layer in self.layers:
-                    h = layer(h)
-                out_chunks.append(h)
-            hidden_states = torch.cat(out_chunks, dim=0)
-        hidden_states = self.ln_post(hidden_states)
-        return hidden_states
+            x.append(F.gelu(self.conv2d3(h)))
+        x = torch.cat(x).permute(0, 3, 1, 2).flatten(2)
+        x = self.conv_out(x)
+        x = x + sinusoids(x.shape[1], x.shape[2], x.device).to(x.dtype)
+        window = x.shape[1] * self.window_chunks  # attention runs within windows of window_chunks chunks
+        last_len = conv_output_length(num_frames - CHUNK_FRAMES * (x.shape[0] - 1))
+        x = torch.cat([x[:-1].flatten(0, 1), x[-1, :last_len]])
+        full = x.shape[0] // window * window
+        groups = [x[:full].unflatten(0, (-1, window))] if full else []
+        if full < x.shape[0]:
+            groups.append(x[full:].unsqueeze(0))
+
+        prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(self.layers), x.device, {"prefetch_dynamic_vbars": True})
+        for layer in self.layers:
+            def core():
+                nonlocal groups
+                groups = [layer(g) for g in groups]
+            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, x.device, layer, x.dtype, core=core, malloc_scope="block")
+        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, x.device, None, malloc_scope="block")
+        return self.ln_post(torch.cat([g.flatten(0, 1) for g in groups]))
 
 
 class MultiModalProjector(nn.Module):
-    def __init__(self, audio_config, device=None, dtype=None, operations=None):
+    def __init__(self, config, device=None, dtype=None, operations=None):
         super().__init__()
-        d_model = audio_config.get("d_model", 896)
-        self.linear_1 = operations.Linear(d_model, d_model, device=device, dtype=dtype)
-        self.linear_2 = operations.Linear(d_model, audio_config.get("output_dim", 1024), device=device, dtype=dtype)
+        self.linear_1 = operations.Linear(config["d_model"], config["d_model"], device=device, dtype=dtype)
+        self.linear_2 = operations.Linear(config["d_model"], config["output_dim"], device=device, dtype=dtype)
 
     def forward(self, x):
         return self.linear_2(F.gelu(self.linear_1(x)))
 
 
-class Qwen3ASRInner(nn.Module):
+class Qwen3ASR(nn.Module):
+    """Qwen3-ASR: windowed audio encoder whose projected features replace <|audio_pad|> tokens in a Qwen3 decoder."""
+
     def __init__(self, config, device=None, dtype=None, operations=None):
         super().__init__()
-        self.config = config
+        text = config["text_config"]
+        llm_config = Qwen3_06BConfig(vocab_size=text["vocab_size"], hidden_size=text["hidden_size"], intermediate_size=text["intermediate_size"],
+                                     num_hidden_layers=text["num_hidden_layers"], num_attention_heads=text["num_attention_heads"],
+                                     num_key_value_heads=text["num_key_value_heads"], rms_norm_eps=text["rms_norm_eps"],
+                                     rope_theta=text["rope_parameters"]["rope_theta"])
+        llm_config.head_dim = text["head_dim"]
+        self.audio_token_id = config["audio_token_id"]
         self.audio_tower = AudioTower(config["audio_config"], device=device, dtype=dtype, operations=operations)
-        self.language_model = Qwen3TextModel(config["text_config"], device=device, dtype=dtype, operations=operations)
         self.multi_modal_projector = MultiModalProjector(config["audio_config"], device=device, dtype=dtype, operations=operations)
-        self.audio_token_id = config.get("audio_token_id", 151676)
+        self.language_model = Llama2_(llm_config, device=device, dtype=dtype, ops=operations)
 
-    def get_audio_features(self, input_features, input_features_mask):
-        hidden = self.audio_tower(input_features, input_features_mask)
-        return self.multi_modal_projector(hidden)
+    def embed(self, input_ids, features, num_frames):
+        audio = self.multi_modal_projector(self.audio_tower(features, num_frames))
+        embeds = self.language_model.embed_tokens(input_ids, out_dtype=audio.dtype)
+        embeds[input_ids == self.audio_token_id] = audio
+        return embeds
+
+    def generate(self, embeds, max_new_tokens, temperature):
+        out = Generator(self.language_model).generate(embeds, do_sample=temperature > 0, max_length=max_new_tokens, temperature=temperature, top_k=0, top_p=1.0,
+                                                      seed=0, execution_dtype=self.dtype)
+        if out and out[-1] in self.language_model.config.stop_tokens:
+            out.pop()
+        return out
 
 
-class Qwen3ASRModel(nn.Module):
+class Qwen3ForcedAligner(Qwen3ASR):
+    """Qwen3-ForcedAligner: the Qwen3-ASR stack with a per-token timestamp classifier."""
+
     def __init__(self, config, device=None, dtype=None, operations=None):
-        super().__init__()
-        self.config = config
-        self.model = Qwen3ASRInner(config, device=device, dtype=dtype, operations=operations)
-        self.device = device
-        self.dtype = dtype
+        super().__init__(config, device=device, dtype=dtype, operations=operations)
+        self.timestamp_token_id = config["timestamp_token_id"]
+        self.timestamp_segment_time = config["timestamp_segment_time"]
+        self.score = operations.Linear(config["text_config"]["hidden_size"], len(config["id2label"]), bias=False, device=device, dtype=dtype)
 
-    def embed_merged(self, input_ids, audio_embeds):
-        inputs_embeds = self.model.language_model.embed_tokens(input_ids)
-        mask = input_ids == self.model.audio_token_id
-        n_tok = int(mask.sum().item())
-        n_feat = int(audio_embeds.shape[0])
-        if n_tok != n_feat:
-            raise RuntimeError("Audio tokens {} != audio features {}".format(n_tok, n_feat))
-        inputs_embeds[mask] = audio_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-        return inputs_embeds
+    def forward(self, input_ids, features, num_frames):
+        x, _ = self.language_model(None, embeds=self.embed(input_ids, features, num_frames))
+        return self.score(x)
 
-    def generate(self, input_ids, audio_embeds, max_new_tokens=512, eos_ids=(151643, 151645), temperature=0.0, callback=None):
-        device = input_ids.device
-        lm = self.model.language_model
-        inputs_embeds = self.embed_merged(input_ids, audio_embeds)
-        bsz, seq_len, _ = inputs_embeds.shape
-        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-        causal = causal.unsqueeze(0).unsqueeze(0).expand(bsz, 1, seq_len, seq_len)
-        hidden, kvs = lm.forward_embeds(inputs_embeds, attention_mask=causal, past_kvs=None, start_pos=0)
-        logit_weight = comfy.ops.cast_to_input(lm.embed_tokens.weight, hidden)
-        logits = F.linear(hidden[:, -1:, :], logit_weight)
-        out_ids = []
-        next_tok = int(logits[0, 0].argmax().item())
-        pos = seq_len
-        for step in range(max_new_tokens):
-            comfy.model_management.throw_exception_if_processing_interrupted()
-            if next_tok in eos_ids:
-                break
-            out_ids.append(next_tok)
-            if callback is not None:
-                callback(step + 1)
-            tok = torch.tensor([[next_tok]], device=device, dtype=torch.long)
-            emb = lm.embed_tokens(tok)
-            hidden, kvs = lm.forward_embeds(emb, attention_mask=None, past_kvs=kvs, start_pos=pos)
-            pos += 1
-            logits = F.linear(hidden[:, -1:, :], logit_weight)
-            if temperature > 0:
-                probs = torch.softmax(logits[0, 0].float() / temperature, dim=-1)
-                next_tok = int(torch.multinomial(probs, 1).item())
-            else:
-                next_tok = int(logits[0, 0].argmax().item())
-        return out_ids
+
+class Generator(BaseQwen3, BaseGenerate):
+    """Comfy's KV-cached decoding loop over a Llama2_ with tied embeddings."""
+
+    def __init__(self, model):
+        self.model = model

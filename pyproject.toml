@@ -1,10 +1,10 @@
 [project]
 name = "ComfyUI-Qwen3ASR-Native"
 description = "Native dependency-free Qwen3-ASR speech-to-text for ComfyUI."
-version = "0.1.1"
+version = "0.1.2"
 license = "MIT"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 
 [project.urls]
 Repository = "https://github.com/Aero-Ex/ComfyUI-Qwen3ASR"

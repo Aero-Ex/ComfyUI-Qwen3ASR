@@ -30,33 +30,6 @@ def is_cjk_char(ch):
     )
 
 
-def tokenize_chinese_mixed(text):
-    tokens = []
-    current_latin = []
-
-    def flush_latin():
-        if current_latin:
-            token = "".join(current_latin)
-            cleaned = clean_token(token)
-            if cleaned:
-                tokens.append(cleaned)
-            del current_latin[:]
-
-    for ch in text:
-        if is_cjk_char(ch):
-            flush_latin()
-            tokens.append(ch)
-        else:
-            if is_kept_char(ch):
-                current_latin.append(ch)
-            else:
-                flush_latin()
-
-    flush_latin()
-
-    return tokens
-
-
 def split_segment_with_chinese(seg):
     tokens = []
     buf = []
